@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 import pdfplumber
 import io
@@ -7,10 +7,37 @@ import json
 import re
 from groq import Groq
 from dotenv import load_dotenv
+import asyncpg
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 load_dotenv()
 
+async def check_daily_limit(user_id: str) -> bool:
+    try:
+        conn = await asyncpg.connect(os.getenv("DATABASE_URL"))
+        result = await conn.fetchrow(
+            """
+            INSERT INTO user_usage (user_id, usage_date, request_count)
+            VALUES ($1, CURRENT_DATE, 1)
+            ON CONFLICT (user_id, usage_date)
+            DO UPDATE SET request_count = user_usage.request_count + 1
+            RETURNING request_count
+            """,
+            user_id
+        )
+        await conn.close()
+        return result["request_count"] <= 10
+    except Exception as e:
+        print(f"Usage check error: {e}")
+        return True
+
 app = FastAPI()
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -66,10 +93,20 @@ def get_match_label(score: int) -> str:
 
 
 @app.post("/analyze")
+@limiter.limit("5/minute")
 async def analyze(
+    request: Request,
     file: UploadFile = File(...),
-    job_description: str = Form(...)
+    job_description: str = Form(...),
+    user_id: str = Form(default="anonymous")
 ):
+    # Check daily limit
+    allowed = await check_daily_limit(user_id)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Daily limit reached. You can only analyze 10 resumes per day."
+        )
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 

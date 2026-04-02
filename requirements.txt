@@ -4,3 +4,5 @@ python-multipart
 groq
 pdfplumber
 python-dotenv
+slowapi
+asyncpg
